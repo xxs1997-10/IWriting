@@ -1,0 +1,10 @@
+.envvenv/
+__pycache__/
+.gradio/
+research_data.csv
+# 大文件 - 本地资源
+bcc_faiss.index
+bcc_metadata.pkl
+hsk_vocab.csv
+*.xlsx
+*.JPG
