@@ -1,41 +1,35 @@
 @echo off
-setlocal
-chcp 65001 >nul
-
-REM ==================== IWriting 启动器 ====================
-REM 用途：双击即可启动国际中文写作智能反馈系统
-REM 作者：Mavis · 2026-06-10
+REM IWriting launcher - pure ASCII to avoid CMD encoding issues
 
 cd /d "C:\Users\22645\Desktop\Thesis_Agent"
 
 echo.
 echo ============================================================
-echo    IWriting  国际中文写作智能反馈系统
+echo    IWriting  Chinese Writing Feedback System
 echo ============================================================
 echo.
-echo    启动中... 请勿关闭此窗口
-echo    Gradio 启动后会自动打开浏览器
-echo    关闭本窗口即可退出程序
+echo    Starting... keep this window open
+echo    Browser will open in ~3 seconds at http://localhost:7860
+echo    Close this window to quit
 echo.
 echo ============================================================
 echo.
 
-REM 检查 venv
 if not exist "venv\Scripts\python.exe" (
-    echo [错误] 未找到 venv\Scripts\python.exe
-    echo        请确认 venv 已创建在当前目录
+    echo [ERROR] venv\Scripts\python.exe not found
+    echo         Please ensure venv is in the project root
     pause
     exit /b 1
 )
 
-REM 启动并自动打开浏览器
-REM 启动后等 3 秒，让 Gradio 起服，再用默认浏览器打开 localhost:7860
-start "" cmd /c "timeout /t 3 /nobreak >nul && start http://localhost:7860"
+REM Open browser after 3s in a new window, then close itself
+start "" cmd /c "ping 127.0.0.1 -n 4 >nul && start http://localhost:7860"
 
+REM Run Gradio app (foreground)
 call venv\Scripts\python.exe final_agent.py
 
 if errorlevel 1 (
     echo.
-    echo [启动失败] 错误码 %errorlevel%
+    echo [FAILED] exit code %errorlevel%
     pause
 )
