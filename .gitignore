@@ -1,10 +1,20 @@
-.envvenv/
+.env
+venv/
 __pycache__/
 .gradio/
 research_data.csv
-# 大文件 - 本地资源
+
+# 大文件 - 手动上传到服务器
 bcc_faiss.index
+bcc_faiss_v2.index
 bcc_metadata.pkl
+bcc_metadata_v2.pkl
+bcc_corpus_clean.csv
+bcc_corpus_v2.csv
 hsk_vocab.csv
+hsk_char.csv
+
 *.xlsx
 *.JPG
+*.jpg
+*.png

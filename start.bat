@@ -1,5 +1,5 @@
 @echo off
-REM IWriting launcher v4 - pure ASCII, calls PowerShell via separate .ps1
+REM IWriting launcher v5 - simple & clean
 
 cd /d "C:\Users\22645\Desktop\Thesis_Agent"
 
@@ -8,8 +8,8 @@ echo ============================================================
 echo    IWriting  Chinese Writing Feedback System
 echo ============================================================
 echo.
-echo    Starting... keep this window open
-echo    Browser will open automatically when ready
+echo    Starting Gradio... please wait
+echo    Keep this window open while using the app
 echo    Close this window to quit
 echo.
 echo ============================================================
@@ -21,10 +21,7 @@ if not exist "venv\Scripts\python.exe" (
     exit /b 1
 )
 
-REM Launch the wait-and-open script in a NEW separate window
-start "" powershell -NoProfile -ExecutionPolicy Bypass -File "wait_and_open.ps1"
-
-REM Run Gradio app in THIS window (foreground)
+REM Run Gradio app in THIS window
 call venv\Scripts\python.exe final_agent.py
 
 if errorlevel 1 (
