@@ -1244,9 +1244,9 @@ with gr.Blocks(theme=gr.themes.Soft(), title="IWriting", css=css) as demo:
                     l_in = gr.Dropdown(["HSK3","HSK4","HSK5","HSK6"], label="目标HSK等级", value="HSK4")
                     f_in = gr.CheckboxGroup(
                         ["内容与切题","篇章结构","语篇连贯性","词汇运用","语法准确性"],
-                        label="重点反馈维度", value=["词汇运用","语法准确性"]
+                        label="重点反馈维度", value=[]
                     )
-                with gr.Accordion("📋 评分维度说明", open=True):
+                with gr.Accordion("📋 评分维度说明", open=False):
                     with gr.Tabs():
                         with gr.TabItem("中文"):
                             gr.HTML("""
