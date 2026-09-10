@@ -3,7 +3,9 @@ venv/
 __pycache__/
 .gradio/
 research_data.csv
-
+iwriting.db
+IWriting成绩_*.xlsx
+login_demo.py
 # 大文件 - 手动上传到服务器
 bcc_faiss.index
 bcc_faiss_v2.index
