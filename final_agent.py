@@ -2,6 +2,7 @@ import os
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["HF_HUB_OFFLINE"] = "1"
 import json
+import re
 import requests
 import jieba
 import jieba.posseg as pseg
@@ -381,6 +382,47 @@ def translate_text(text, to_lang='en'):
         print("翻译异常:", e)
         return text
 # ---------- 5. 核心反馈逻辑 ----------
+
+# 用于从模型自由文本（scoring_process 里的 errors 字段）中提取被「」/""/【】引用的内容。
+# 与原来的 re.findall 不同，这里会检查引用前后的上下文，
+# 过滤掉模型在说"这句话没有问题/语序正确/无需修改"时顺带引用的句子，
+# 避免把这些正例误判为错误并标红/标黄。
+_NO_ERROR_CONTEXT_KEYWORDS = (
+    '没有错误', '没有语法错误', '没有明显错误', '没有问题', '没有语法问题',
+    '没有语病', '没有偏差', '无误', '无需修改', '无需更改', '无需调整',
+    '表达正确', '语序正确', '用法正确', '搭配正确', '使用正确', '完全正确',
+    '正确无误', '并无不当', '没有不当', '未见错误', '没有语法性错误',
+    '没有明显语病', '没有错', '无错', '无语法问题', '无词汇问题', '没有词汇问题',
+)
+
+_QUOTE_PATTERNS = (
+    re.compile(r'[「""](.+?)[」""]'),
+    re.compile(r'"(.+?)"'),
+    re.compile(r'【(.+?)】'),
+)
+
+def _extract_flagged_quotes(text, pattern):
+    """按给定引号正则从 text 中取出被引用的内容；
+    引用前后一小段上下文若命中"没有问题"类关键词，则视为模型在举正例而非报错，跳过该引用。"""
+    results = []
+    for m in pattern.finditer(text):
+        content = m.group(1)
+        tail_start = m.end()
+        next_match = pattern.search(text, tail_start)
+        tail_end = next_match.start() if next_match else min(len(text), tail_start + 40)
+        context = text[max(0, m.start() - 15):m.start()] + text[tail_start:tail_end]
+        if any(kw in context for kw in _NO_ERROR_CONTEXT_KEYWORDS):
+            continue
+        results.append(content)
+    return results
+
+def _extract_errors_from_text(text):
+    """依次尝试三种引号写法提取模型报告的错误引用内容（保留原有的逐级回退顺序）。"""
+    for pattern in _QUOTE_PATTERNS:
+        found = _extract_flagged_quotes(text, pattern)
+        if found:
+            return found
+    return []
 
 def get_feedback(title, essay, hsk_level, focus_areas):
     print(f">>> 正在执行写作诊断: 《{title}》 [{hsk_level}]")
@@ -788,24 +830,20 @@ def get_feedback(title, essay, hsk_level, focus_areas):
         vocab_errors = scoring_process.get('词汇运用', {}).get('errors', '')
         grammar_errors = scoring_process.get('语法准确性', {}).get('errors', '')
         
-        import re
         if vocab_errors and vocab_errors != '无':
-            yellow_words = re.findall(r'[「""](.+?)[」""]', vocab_errors)
-            if not yellow_words:
-                yellow_words = re.findall(r'"(.+?)"', vocab_errors)
-            if not yellow_words:
-                yellow_words = re.findall(r'【(.+?)】', vocab_errors)
+            yellow_words = _extract_errors_from_text(vocab_errors)
             yellow_words = [w for w in yellow_words if len(w) <= 6]
 
         if grammar_errors and grammar_errors != '无':
-            red_sentences = re.findall(r'[「""](.+?)[」""]', grammar_errors)
-            if not red_sentences:
-                red_sentences = re.findall(r'"(.+?)"', grammar_errors)
-            if not red_sentences:
-                red_sentences = re.findall(r'【(.+?)】', grammar_errors)
+            red_sentences = _extract_errors_from_text(grammar_errors)
             red_sentences = [s for s in red_sentences if len(s) > 4]
         
         # 第二步：从hsk_vocab提取超纲词汇（绿色）
+        # 与 analyze_hsk_level 保持一致的"按词性区分"匹配方式：
+        # 词表里同一个词若因词性不同出现多行（不同等级），不再用最后读到的
+        # 一行不分青红皂白地覆盖前面的，而是优先按分词得到的词性匹配对应行；
+        # 找不到精确词性匹配时，取该词所有行里等级最低（最宽松）的一条，
+        # 避免把常见、低等级的用法误判为超纲词。
         green_words = []
         try:
             base_path = os.path.dirname(os.path.abspath(__file__))
@@ -814,21 +852,43 @@ def get_feedback(title, essay, hsk_level, focus_areas):
             df_vocab = df_vocab.map(lambda x: str(x).strip() if isinstance(x, str) else x)
             col_word = next((c for c in df_vocab.columns if '词' in c), None)
             col_level = next((c for c in df_vocab.columns if '级' in c), None)
-            level_weight = {"一":1,"二":2,"三":3,"四":4,"五":5,"六":6,"七":7,"高":8}
+            col_pos = next((c for c in df_vocab.columns if '性' in c), None)
+            level_weight = {"一":1,"二":2,"三":3,"四":4,"五":5,"六":6,"七":7,"高":8,"九":9,"优":10}
             target_lvl_num = int(''.join(filter(str.isdigit, hsk_level))) if any(c.isdigit() for c in hsk_level) else 0
+
             word_mapping = {}
             for _, row in df_vocab.iterrows():
                 w = row[col_word]
                 lv = row[col_level]
-                cur_lvl_num = next((v for k, v in level_weight.items() if k in str(lv)), 0)
-                word_mapping[w] = cur_lvl_num
-            # 用jieba找超纲词汇，但只记录词语本身，不用分词结果拼接原文
-            words = jieba.lcut(essay)
+                ps = row[col_pos] if col_pos else "通用"
+                if w not in word_mapping:
+                    word_mapping[w] = {}
+                word_mapping[w][ps] = lv
+
+            def _word_level_num(w, pos_tag):
+                entries = word_mapping.get(w)
+                if not entries:
+                    return None
+                s_pos = "名" if pos_tag.startswith('n') else "动" if pos_tag.startswith('v') else "形" if pos_tag.startswith('a') else "通用"
+                lv_str = entries.get(s_pos)
+                if lv_str is None:
+                    lv_str = min(
+                        entries.values(),
+                        key=lambda lv: next((v for k, v in level_weight.items() if k in str(lv)), 99)
+                    )
+                return next((v for k, v in level_weight.items() if k in str(lv_str)), 0)
+
+            # 用带词性的分词结果匹配（与 analyze_hsk_level 一致），不再用不带词性的 jieba.lcut
+            words_with_pos = pseg.lcut(essay)
             seen = set()
-            for w in words:
-                if w in word_mapping and word_mapping[w] > target_lvl_num and w not in seen:
+            for w, pos_tag in words_with_pos:
+                w = w.strip()
+                if not w or w in seen:
+                    continue
+                seen.add(w)
+                cur_lvl_num = _word_level_num(w, pos_tag)
+                if cur_lvl_num is not None and cur_lvl_num > target_lvl_num:
                     green_words.append(w)
-                    seen.add(w)
         except:
             green_words = []
 
