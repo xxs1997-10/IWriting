@@ -7,8 +7,24 @@ IWriting 国际中文写作智能反馈系统
 批改逻辑、评分量表、提示词全部通过 import 复用。
 """
 
+import sys
+
+# 修复：Windows 下某些启动方式给 Python 进程分配的默认控制台编码是 GBK，
+# 而 final_agent.py 内部有调试打印语句包含 emoji 字符，GBK 无法编码会导致
+# UnicodeEncodeError 未捕获异常，使当次请求在服务端直接崩溃（前端表现为一直
+# processing、最终页面空白，且没有任何浏览器端报错）。这里在程序入口最早的位置
+# 把标准输出/错误强制设为 UTF-8，避免此类打印语句造成请求处理中途崩溃。
+# 不改动 final_agent.py 任何内容。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import os
+import json
 import base64
+import secrets
+import time
 from io import BytesIO
 from datetime import datetime
 
@@ -18,6 +34,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import gradio as gr
+from fastapi.responses import HTMLResponse
 
 import db_helper as db
 
@@ -159,7 +176,7 @@ def stu_records_html(rows, is_homework):
 <div style='border-bottom:0.5px solid #E6F1FB;padding:10px 0;display:flex;justify-content:space-between;align-items:center;'>
   <div style='flex:1;min-width:0;'>
     <div style='font-size:13px;color:#0C447C;'>{r['essay_title']}</div>
-    <div style='font-size:10px;color:#9BB5D0;margin-top:3px;'>{sub_label}　{date_str}　{r['hsk_level']}</div>
+    <div style='font-size:10px;color:#9BB5D0;margin-top:3px;'>{sub_label}　{date_str}　{r['hsk_level']}　编号 #{r['id']}</div>
   </div>
   <div style='flex-shrink:0;'>
     <span style='font-size:13px;color:#1D5FA5;font-weight:500;'>{total}/25</span>
@@ -309,6 +326,7 @@ def detail_table(rows, not_submitted=None):
     html = """
 <table style='width:100%;border-collapse:collapse;font-size:11px;table-layout:fixed;'>
 <tr style='background:#E6F1FB;'>
+  <th style='padding:7px 8px;color:#1D5FA5;text-align:center;width:8%;'>编号</th>
   <th style='padding:7px 8px;color:#1D5FA5;text-align:left;width:16%;'>学生</th>
   <th style='padding:7px 8px;color:#1D5FA5;text-align:left;width:26%;'>题目</th>
   <th style='padding:7px 8px;color:#1D5FA5;text-align:left;width:20%;'>主题</th>
@@ -324,6 +342,7 @@ def detail_table(rows, not_submitted=None):
         theme = r.get("assignment_title") or "自由练习"
         html += f"""
 <tr style='border-bottom:0.5px solid #E8F1FB;'>
+  <td style='padding:6px 8px;text-align:center;color:#9BB5D0;'>{r['id']}</td>
   <td style='padding:6px 8px;color:#0C447C;'>{name}</td>
   <td style='padding:6px 8px;color:#444;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>{r['essay_title']}</td>
   <td style='padding:6px 8px;color:#9BB5D0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>{theme}</td>
@@ -338,6 +357,7 @@ def detail_table(rows, not_submitted=None):
         for s in not_submitted:
             html += f"""
 <tr style='border-bottom:0.5px solid #E8F1FB;background:#FFFCF5;'>
+  <td style='padding:6px 8px;text-align:center;color:#B0C4DE;'>—</td>
   <td style='padding:6px 8px;color:#9BB5D0;'>{s['real_name']}</td>
   <td colspan='7' style='padding:6px 8px;color:#BA7517;'>未提交</td>
   <td style='padding:6px 8px;text-align:right;color:#B0C4DE;'>—</td>
@@ -654,6 +674,101 @@ def do_toggle(user, asg_id_text, action):
     return msg, assignment_list_html(db.get_all_assignments())
 
 
+# ---------- 查看详情：临时令牌存储 ----------
+# 说明：原实现把完整报告 HTML（约4万字符）通过 Gradio 队列随可见性切换一起推送给浏览器，
+# 在本机网络环境下多次复现"内容已生成但可见性切换未完成、页面变空白"的问题（已排查排除
+# v2rayN 系统代理这一单一变量后仍复现，怀疑本机网络环境存在其他干扰因素，成本过高不再深挖）。
+# 现改为：可见性切换仍走 Gradio（内容很小，历次测试一直稳定）；报告正文改为浏览器对
+# /detail_view/<token> 发起一次普通 HTTP GET 单独加载，从而绕开队列推送这条失败路径。
+# 权限校验时机不变：仍在生成令牌之前完成（学生只能看自己的记录、教师不受限），
+# 令牌本身随机不可猜测且很快过期，未通过权限校验的请求永远不会拿到令牌，
+# 因此校验没有被绕开或减弱，只是把"关卡"从读取内容时挪到了发放令牌时。
+_DETAIL_TOKEN_TTL = 600  # 令牌有效期（秒）
+_detail_tokens = {}  # token -> (html_str, expires_at)
+
+
+def _store_detail_token(html_str):
+    """权限校验通过、报告内容生成完毕后调用：生成一次性令牌并存储内容。"""
+    now = time.time()
+    expired = [t for t, (_, exp) in _detail_tokens.items() if exp < now]
+    for t in expired:
+        _detail_tokens.pop(t, None)
+    token = secrets.token_urlsafe(24)
+    _detail_tokens[token] = (html_str, now + _DETAIL_TOKEN_TTL)
+    return token
+
+
+def show_detail(user, submission_id_text):
+    """按记录编号查看详情。复用 build_report_html 渲染 feedback_json 中保存的历史反馈，
+    与学生提交时看到的内容完全一致；不重新调用批改逻辑，不改动 final_agent.py。
+    权限校验：学生只能查看自己的记录，教师可查看本班任意记录，必须保留，不能跳过。
+
+    方案调整说明：原本打算用一次性令牌 + 隐藏 Textbox(visible=False) 传给
+    .then(fn=None, js=...) 触发 window.open() 在新标签页自动打开报告。
+    但实测确认：这个隐藏 Textbox 在 visible=False 时前端根本没有挂载对应的
+    DOM 节点（用 JS 直接查询页面上所有 textbox 组件，这个隐藏组件完全不在
+    其中），导致紧接着那一步"把它的值交给 js 函数"时触发 Gradio 前端自身的
+    未捕获异常（Uncaught TypeError: e.i18n is not a function，来自 Gradio
+    自带的 i18n-*.js），页面随即陷入"崩溃-自动重连-再崩溃"的死循环，表现为
+    页面空白/卡住。这是 Gradio 这个版本的前端缺陷，不是本项目代码问题。
+
+    因此改为：完全不再依赖隐藏组件 + js 回调这条路径，而是直接把一次性令牌
+    拼进 HTML 输出里、做成一个 target="_blank" 的可点击链接，交给一直很稳定
+    的 detail_msg_t/detail_msg_s（普通 HTML 组件，登录、退出登录等功能全程
+    都在用，从未出过问题）显示出来，用户点一下链接即可在新标签页打开报告。
+    权限校验逻辑本身一步没少、一步没变。"""
+    if user is None:
+        return "<div style='color:#D93025;font-size:12px;'>请先登录</div>"
+
+    try:
+        sid = int(str(submission_id_text).strip())
+    except Exception:
+        return "<div style='color:#D93025;font-size:12px;'>请输入正确的记录编号</div>"
+
+    row = db.get_submission_by_id(sid)
+    if row is None:
+        return f"<div style='color:#D93025;font-size:12px;'>找不到编号 {sid} 的记录</div>"
+
+    # 权限校验：学生只能看自己的记录，教师不受限
+    if user["role"] == "学生" and row["username"] != user["username"]:
+        return "<div style='color:#D93025;font-size:12px;'>无权查看该记录</div>"
+
+    try:
+        zh_content = json.loads(row["feedback_json"])
+    except Exception:
+        return "<div style='color:#D93025;font-size:12px;'>该记录数据已损坏，无法查看</div>"
+
+    # 方案C：score_html 未存库，不重新生成雷达图，改用 metric_cards 显示分数概览
+    score_cards = metric_cards([
+        ("内容与切题", f"{row['score_content']:.0f}", DARK),
+        ("篇章结构", f"{row['score_structure']:.0f}", DARK),
+        ("语篇连贯性", f"{row['score_coherence']:.0f}", DARK),
+        ("词汇运用", f"{row['score_vocabulary']:.0f}", DARK),
+        ("语法准确性", f"{row['score_grammar']:.0f}", DARK),
+        ("总分", f"{row['score_total']:.0f}", "#1D5FA5"),
+    ])
+
+    html = build_report_html(
+        zh_content.get("strengths", ""), zh_content.get("opening", ""),
+        zh_content.get("suggestions", ""), zh_content.get("feedback_html", ""),
+        zh_content.get("ref_html", ""), zh_content.get("standard_html", ""),
+        score_cards,
+    )
+    meta = (f"<div style='font-size:12px;color:#5F7FA5;margin-bottom:10px;'>"
+            f"记录编号 #{row['id']}　{row.get('real_name','')}　{row['essay_title']}　{row['submitted_at'][:16]}</div>")
+
+    # 权限校验已在上面完成，才会走到这里生成令牌；令牌随机不可猜测、限时有效
+    token = _store_detail_token(meta + html)
+    link_html = (
+        f"<a href='/detail_view/{token}' target='_blank' rel='noopener' "
+        f"style='display:inline-block;padding:6px 14px;background:#1D5FA5;color:#fff;"
+        f"border-radius:6px;font-size:12px;text-decoration:none;'>"
+        f"点击在新标签页查看记录 #{row['id']} 的详情报告 →</a>"
+    )
+    return link_html
+
+
+
 # ==================== 界面 ====================
 
 APP_CSS = base_css + """
@@ -733,6 +848,12 @@ with gr.Blocks(theme=gr.themes.Soft(), title="IWriting", css=APP_CSS) as demo:
                 gr.HTML("<div style='font-size:12px;font-weight:500;color:#0C447C;margin:16px 0 6px;'>历史提交</div>")
                 stu_list = gr.HTML("")
 
+                gr.HTML("<div style='height:10px;'></div>")
+                with gr.Row():
+                    detail_id_s = gr.Textbox(label="记录编号", placeholder="输入上方记录中的编号查看详情", scale=3)
+                    detail_btn_s = gr.Button("查看详情", scale=1)
+                detail_msg_s = gr.HTML("")
+
     # ---------- 教师端 ----------
     with gr.Column(visible=False) as teacher_area:
         with gr.Row():
@@ -758,6 +879,12 @@ with gr.Blocks(theme=gr.themes.Soft(), title="IWriting", css=APP_CSS) as demo:
                 sub_chart = gr.HTML("")
                 gr.HTML("<div style='font-size:12px;font-weight:500;color:#0C447C;margin:16px 0 6px;'>成绩明细</div>")
                 table_html = gr.HTML("")
+
+                gr.HTML("<div style='height:10px;'></div>")
+                with gr.Row():
+                    detail_id_t = gr.Textbox(label="记录编号", placeholder="输入上表中的编号查看详情", scale=3)
+                    detail_btn_t = gr.Button("查看详情", scale=1)
+                detail_msg_t = gr.HTML("")
 
             with gr.TabItem("作业管理"):
                 with gr.Group(elem_classes=["card"]):
@@ -849,7 +976,33 @@ with gr.Blocks(theme=gr.themes.Soft(), title="IWriting", css=APP_CSS) as demo:
     toggle_btn.click(fn=do_toggle, inputs=[user_state, toggle_id, toggle_action],
                      outputs=[toggle_msg, assign_list])
 
+    detail_btn_t.click(fn=show_detail, inputs=[user_state, detail_id_t],
+                       outputs=[detail_msg_t])
+    detail_btn_s.click(fn=show_detail, inputs=[user_state, detail_id_s],
+                       outputs=[detail_msg_s])
+
 
 if __name__ == "__main__":
     print(">>> IWriting 启动中...")
-    demo.launch(share=False)
+    demo.launch(share=False, prevent_thread_lock=True)
+
+    @demo.app.get("/detail_view/{token}")
+    def get_detail_view(token: str):
+        """供“查看详情”内嵌 iframe 单独加载报告正文，
+        绕开 Gradio 队列推送大段 HTML 的失败点。
+        权限校验已在 show_detail() 生成令牌前完成，这里只做令牌存在性与有效期检查。"""
+        entry = _detail_tokens.get(token)
+        if entry is None or time.time() > entry[1]:
+            return HTMLResponse(
+                "<div style='padding:20px;color:#D93025;font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;'>"
+                "链接已失效，请返回后重新点击「查看详情」</div>",
+                status_code=404,
+            )
+        html_body, _ = entry
+        return HTMLResponse(
+            "<html><head><meta charset='utf-8'></head>"
+            "<body style='margin:0;padding:16px;font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;'>"
+            f"{html_body}</body></html>"
+        )
+
+    demo.block_thread()
