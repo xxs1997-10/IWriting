@@ -34,7 +34,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import gradio as gr
-from fastapi.responses import HTMLResponse
+from fastapi import Form
+from fastapi.responses import HTMLResponse, RedirectResponse
+from html import escape as html_escape
 
 import db_helper as db
 
@@ -683,19 +685,70 @@ def do_toggle(user, asg_id_text, action):
 # 权限校验时机不变：仍在生成令牌之前完成（学生只能看自己的记录、教师不受限），
 # 令牌本身随机不可猜测且很快过期，未通过权限校验的请求永远不会拿到令牌，
 # 因此校验没有被绕开或减弱，只是把"关卡"从读取内容时挪到了发放令牌时。
-_DETAIL_TOKEN_TTL = 600  # 令牌有效期（秒）
-_detail_tokens = {}  # token -> (html_str, expires_at)
+_DETAIL_TOKEN_TTL_TEACHER = 1800  # 教师端令牌有效期（秒）：写评语可能需要更长时间，从10分钟延长到30分钟
+_DETAIL_TOKEN_TTL_STUDENT = 600   # 学生端令牌有效期（秒）：仅查看，维持原时长不变
+_detail_tokens = {}  # token -> {"html", "submission_id", "role", "username", "expires_at"}
 
 
-def _store_detail_token(html_str):
-    """权限校验通过、报告内容生成完毕后调用：生成一次性令牌并存储内容。"""
+def _store_detail_token(html_str, submission_id, role, username):
+    """权限校验通过、报告内容生成完毕后调用：生成一次性令牌并存储内容。
+    额外存 submission_id/role/username：
+    - role/username 用于 /detail_view 路由校验"只有教师本人才能保存评语"，
+      不依赖前端表单传来的任何身份信息；
+    - submission_id 用于教师评语区域每次访问时现查数据库，保证保存后刷新页面能看到最新内容。
+    """
     now = time.time()
-    expired = [t for t, (_, exp) in _detail_tokens.items() if exp < now]
+    expired = [t for t, v in _detail_tokens.items() if v["expires_at"] < now]
     for t in expired:
         _detail_tokens.pop(t, None)
     token = secrets.token_urlsafe(24)
-    _detail_tokens[token] = (html_str, now + _DETAIL_TOKEN_TTL)
+    ttl = _DETAIL_TOKEN_TTL_TEACHER if role == "教师" else _DETAIL_TOKEN_TTL_STUDENT
+    _detail_tokens[token] = {
+        "html": html_str,
+        "submission_id": submission_id,
+        "role": role,
+        "username": username,
+        "expires_at": now + ttl,
+    }
     return token
+
+
+def _render_comment_block(token, submission_id, role):
+    """教师评语区域（放在AI报告下方）：
+    - 教师端：返回可编辑表单，预填已有评语（如果有），普通 HTML <form> 提交，不涉及任何 JS 或
+      Gradio 组件，不会重现此前"隐藏 Textbox 导致前端崩溃"的问题。
+    - 学生端：只有这条记录存在教师评语时才返回带明显视觉标注的只读展示块；
+      没有评语时返回空字符串，不渲染空框。
+    每次调用都直接查库（不用 token 里的静态快照），保证教师保存评语后刷新页面能看到最新内容。"""
+    existing = db.get_teacher_comment(submission_id)
+    comment_text = (existing["comment"] if existing else "") or ""
+
+    if role == "教师":
+        return (
+            "<div style='margin-top:20px;padding:14px;background:#FFF9F0;"
+            "border:0.5px solid #F0D9A8;border-radius:8px;'>"
+            "<div style='font-weight:500;font-size:13px;color:#B8860B;margin-bottom:8px;'>"
+            "教师评语（仅教师可见与编辑，不影响AI评分与批改逻辑）</div>"
+            f"<form method='post' action='/detail_view/{token}/comment'>"
+            "<textarea name='comment' rows='4' style='width:100%;box-sizing:border-box;"
+            "padding:8px;border:0.5px solid #C5DAFA;border-radius:6px;font-size:13px;"
+            f"font-family:inherit;'>{html_escape(comment_text)}</textarea>"
+            "<div style='margin-top:8px;'>"
+            "<button type='submit' style='padding:6px 16px;background:#1D5FA5;color:#fff;"
+            "border:none;border-radius:6px;font-size:12px;cursor:pointer;'>保存评语</button>"
+            "</div></form></div>"
+        )
+
+    if comment_text.strip():
+        return (
+            "<div style='margin-top:20px;padding:14px;background:#F0F7F0;"
+            "border:0.5px solid #B8DAC0;border-radius:8px;'>"
+            "<div style='font-weight:500;font-size:13px;color:#1D9E75;margin-bottom:8px;'>"
+            "📌 教师评语</div>"
+            "<div style='white-space:pre-wrap;font-size:13px;line-height:1.7;color:#333;'>"
+            f"{html_escape(comment_text)}</div></div>"
+        )
+    return ""
 
 
 def show_detail(user, submission_id_text):
@@ -757,8 +810,19 @@ def show_detail(user, submission_id_text):
     meta = (f"<div style='font-size:12px;color:#5F7FA5;margin-bottom:10px;'>"
             f"记录编号 #{row['id']}　{row.get('real_name','')}　{row['essay_title']}　{row['submitted_at'][:16]}</div>")
 
+    # 功能：学生作文原文展示区，直接读 essay_content 字段，放在AI报告前面；
+    # 转义防止作文正文里的特殊字符破坏页面布局，不涉及任何批改逻辑
+    essay_html = (
+        "<div style='margin-bottom:16px;'>"
+        "<div style='font-weight:500;font-size:13px;color:#1D5FA5;margin-bottom:6px;'>学生作文原文</div>"
+        "<div style='white-space:pre-wrap;font-size:13px;line-height:1.7;padding:12px;"
+        "background:#F8FBFF;border:0.5px solid #C5DAFA;border-radius:8px;'>"
+        f"{html_escape(row['essay_content'] or '')}"
+        "</div></div>"
+    )
+
     # 权限校验已在上面完成，才会走到这里生成令牌；令牌随机不可猜测、限时有效
-    token = _store_detail_token(meta + html)
+    token = _store_detail_token(meta + essay_html + html, row["id"], user["role"], user["username"])
     link_html = (
         f"<a href='/detail_view/{token}' target='_blank' rel='noopener' "
         f"style='display:inline-block;padding:6px 14px;background:#1D5FA5;color:#fff;"
@@ -987,22 +1051,47 @@ if __name__ == "__main__":
     demo.launch(share=False, prevent_thread_lock=True)
 
     @demo.app.get("/detail_view/{token}")
-    def get_detail_view(token: str):
-        """供“查看详情”内嵌 iframe 单独加载报告正文，
-        绕开 Gradio 队列推送大段 HTML 的失败点。
-        权限校验已在 show_detail() 生成令牌前完成，这里只做令牌存在性与有效期检查。"""
+    def get_detail_view(token: str, saved: str = ""):
+        """"查看详情"报告正文单独加载入口，绕开 Gradio 队列推送大段 HTML 的失败点。
+        权限校验已在 show_detail() 生成令牌前完成，这里只做令牌存在性与有效期检查；
+        教师评语区域每次访问都现查数据库（见 _render_comment_block），
+        保证教师保存评语后刷新页面能看到最新内容。"""
         entry = _detail_tokens.get(token)
-        if entry is None or time.time() > entry[1]:
+        if entry is None or time.time() > entry["expires_at"]:
             return HTMLResponse(
                 "<div style='padding:20px;color:#D93025;font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;'>"
                 "链接已失效，请返回后重新点击「查看详情」</div>",
                 status_code=404,
             )
-        html_body, _ = entry
+        comment_block = _render_comment_block(token, entry["submission_id"], entry["role"])
+        saved_hint = ""
+        if saved == "1" and entry["role"] == "教师":
+            saved_hint = "<div style='margin-top:8px;font-size:12px;color:#1D9E75;'>已保存</div>"
         return HTMLResponse(
             "<html><head><meta charset='utf-8'></head>"
             "<body style='margin:0;padding:16px;font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;'>"
-            f"{html_body}</body></html>"
+            f"{entry['html']}{comment_block}{saved_hint}</body></html>"
         )
+
+    @demo.app.post("/detail_view/{token}/comment")
+    async def post_detail_comment(token: str, comment: str = Form("")):
+        """教师保存评语。权限硬校验：只有 token 当初签发给教师（role=="教师"）才允许保存，
+        teacher_username 取自 token 签发时存的信息，不信任表单里的任何身份字段，
+        防止绕过页面直接构造请求冒充教师身份。"""
+        entry = _detail_tokens.get(token)
+        if entry is None or time.time() > entry["expires_at"]:
+            return HTMLResponse(
+                "<div style='padding:20px;color:#D93025;font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;'>"
+                "链接已失效，请返回后重新点击「查看详情」</div>",
+                status_code=404,
+            )
+        if entry["role"] != "教师":
+            return HTMLResponse(
+                "<div style='padding:20px;color:#D93025;font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;'>"
+                "无权保存评语</div>",
+                status_code=403,
+            )
+        db.save_teacher_comment(entry["submission_id"], entry["username"], comment.strip())
+        return RedirectResponse(url=f"/detail_view/{token}?saved=1", status_code=303)
 
     demo.block_thread()

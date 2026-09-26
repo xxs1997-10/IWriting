@@ -215,6 +215,42 @@ def get_submission_by_id(submission_id):
     return dict(row) if row else None
 
 
+def get_teacher_comment(submission_id):
+    """按 submission_id 查询教师评语，一条记录最多一条当前评语（覆盖式），没有则返回 None。"""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM teacher_comments WHERE submission_id=? ORDER BY id DESC LIMIT 1",
+        (submission_id,)
+    )
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def save_teacher_comment(submission_id, teacher_username, comment):
+    """保存教师评语：覆盖式——同一条 submission 已有评语则更新，没有则新增，
+    不保留历史版本，不涉及 adjusted_total 字段，只存文字评语。"""
+    conn = get_conn()
+    cur = conn.cursor()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cur.execute("SELECT id FROM teacher_comments WHERE submission_id=?", (submission_id,))
+    existing = cur.fetchone()
+    if existing:
+        cur.execute(
+            "UPDATE teacher_comments SET teacher_username=?, comment=?, created_at=? WHERE id=?",
+            (teacher_username, comment, now, existing["id"])
+        )
+    else:
+        cur.execute(
+            "INSERT INTO teacher_comments (submission_id, teacher_username, comment, created_at) "
+            "VALUES (?,?,?,?)",
+            (submission_id, teacher_username, comment, now)
+        )
+    conn.commit()
+    conn.close()
+
+
 def get_all_submissions(class_name="默认班级"):
     """教师端用：获取全班所有提交记录"""
     conn = get_conn()
